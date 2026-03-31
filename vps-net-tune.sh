@@ -56,6 +56,7 @@ FILE_BEFORE_META="$RUN_DIR/file-before-meta-$RUN_UTC.tsv"  # label \t existed(0/
 # Globals collected at runtime
 # ----------------------------
 NODE_PROTO=""        # tcp|udp|both
+VPN_NAME=""          # user-facing label from VPN/代理 menu
 APPLY_MODE=""        # dry-run|confirm|apply|exit
 
 OS_PRETTY="unknown"
@@ -99,6 +100,7 @@ SYS_SOMAXCONN="unknown"
 SYS_TCP_MAX_SYN_BACKLOG="unknown"
 SYS_TCP_MTU_PROBING="unknown"
 SYS_RPS_SOCK_FLOW_ENTRIES="unknown"
+SYS_UDP_RMEM_MIN="unknown"
 
 # Offloads
 OFF_TSO="unknown"
@@ -252,20 +254,13 @@ _is_tty() { [[ -t 0 && -t 1 ]]; }
 _menu_select() {
   # Usage: _menu_select "prompt" "opt1" "opt2" ...
   # Returns: selected index in $MENU_RET
+  # TTY: redraw with CUU(N)+EL per line (avoids tput sc/rc issues on SSH/IDE terminals).
   local prompt="$1"; shift
   local -a options=("$@")
   local selected=0
   local key="" k2=""
 
-  local can_tput=0
-  if _is_tty && _has_cmd tput; then
-    if tput sc >/dev/null 2>&1 && tput rc >/dev/null 2>&1 && tput el >/dev/null 2>&1; then
-      can_tput=1
-    fi
-  fi
-
-  # Fallback if no TTY or tput lacks needed capabilities
-  if (( can_tput == 0 )); then
+  if ! _is_tty; then
     printf "%s\n" "$prompt"
     local i=0
     for i in "${!options[@]}"; do
@@ -280,28 +275,31 @@ _menu_select() {
     return 0
   fi
 
-  printf "%s\n" "$prompt"
-  # Save cursor position
-  tput sc
+  local n="${#options[@]}"
+  if (( n == 0 )); then
+    MENU_RET=0
+    return 0
+  fi
 
+  printf "%s\n" "$prompt"
+  local first=1
   while true; do
-    # Restore cursor position, redraw menu lines
-    tput rc
+    if (( first == 0 )); then
+      printf '\033[%dA' "$n"
+    fi
+    first=0
     local i
     for i in "${!options[@]}"; do
-      tput el
+      printf '\033[2K\r'
       if (( i == selected )); then
-        # arrow indicator
         printf "→ %s\n" "${options[$i]}"
       else
         printf "  %s\n" "${options[$i]}"
       fi
     done
 
-    # Read key
     IFS= read -rsn1 key || true
     if [[ "$key" == $'\x1b' ]]; then
-      # Escape sequence (arrow)
       IFS= read -rsn2 k2 || true
       key+="$k2"
       case "$key" in
@@ -311,7 +309,6 @@ _menu_select() {
       if (( selected < 0 )); then selected=$((${#options[@]} - 1)); fi
       if (( selected >= ${#options[@]} )); then selected=0; fi
     elif [[ "$key" == "" || "$key" == $'\n' || "$key" == $'\r' ]]; then
-      # Enter
       MENU_RET="$selected"
       printf "\n"
       return 0
@@ -834,6 +831,7 @@ _get_buffers_and_mtu_flags() {
   SYS_TCP_MAX_SYN_BACKLOG="$(_sysctl_get net.ipv4.tcp_max_syn_backlog)"; SYS_TCP_MAX_SYN_BACKLOG="${SYS_TCP_MAX_SYN_BACKLOG:-unknown}"
   SYS_TCP_MTU_PROBING="$(_sysctl_get net.ipv4.tcp_mtu_probing)"; SYS_TCP_MTU_PROBING="${SYS_TCP_MTU_PROBING:-unknown}"
   SYS_RPS_SOCK_FLOW_ENTRIES="$(_sysctl_get net.core.rps_sock_flow_entries)"; SYS_RPS_SOCK_FLOW_ENTRIES="${SYS_RPS_SOCK_FLOW_ENTRIES:-unknown}"
+  SYS_UDP_RMEM_MIN="$(_sysctl_get net.ipv4.udp_rmem_min)"; SYS_UDP_RMEM_MIN="${SYS_UDP_RMEM_MIN:-unknown}"
 }
 
 _get_offload_states() {
@@ -1217,6 +1215,7 @@ _write_report() {
     printf "  net.ipv4.tcp_max_syn_backlog: %s\n" "$SYS_TCP_MAX_SYN_BACKLOG"
     printf "  net.ipv4.tcp_mtu_probing: %s\n" "$SYS_TCP_MTU_PROBING"
     printf "  net.core.rps_sock_flow_entries: %s\n" "$SYS_RPS_SOCK_FLOW_ENTRIES"
+    printf "  net.ipv4.udp_rmem_min: %s\n" "$SYS_UDP_RMEM_MIN"
     printf "\n"
 
     printf "[6] Offload (read-only)\n"
@@ -1291,6 +1290,10 @@ _plan_add_module() {
 
 _is_tcp_related() {
   [[ "$NODE_PROTO" == "tcp" || "$NODE_PROTO" == "both" ]]
+}
+
+_is_udp_related() {
+  [[ "$NODE_PROTO" == "udp" || "$NODE_PROTO" == "both" ]]
 }
 
 # Decide recommended buffer/backlog values by memory size (conservative & safe)
@@ -1422,6 +1425,15 @@ _build_plan() {
     fi
   fi
 
+  # 3b) UDP receive floor (when profile includes UDP)
+  if _is_udp_related; then
+    if _sysctl_exists net.ipv4.udp_rmem_min; then
+      if [[ "$SYS_UDP_RMEM_MIN" =~ ^[0-9]+$ ]] && (( SYS_UDP_RMEM_MIN < 8192 )); then
+        _plan_add_sysctl "udp_rmem_min" "提高 net.ipv4.udp_rmem_min（UDP 接收下限，代理/QUIC 场景）" "LOW" "net.ipv4.udp_rmem_min" "8192"
+      fi
+    fi
+  fi
+
   # 4) Enable tcp_mtu_probing if TCP-ish and currently disabled and/or PMTU mismatch suspected
   if _is_tcp_related; then
     local need=0
@@ -1489,7 +1501,7 @@ _write_plan() {
   {
     printf "Change plan (proposed)\n"
     printf "Run id (UTC): %s\n" "$RUN_UTC"
-    printf "Protocol selection: %s\n" "$NODE_PROTO"
+    printf "Protocol selection: VPN=%s | kernel_profile=%s\n" "$VPN_NAME" "$NODE_PROTO"
     printf "\n"
 
     if (( ${#PLAN_ID[@]} == 0 )); then
@@ -2084,7 +2096,7 @@ _usage() {
 Usage: sudo ./$SCRIPT_NAME
 
 This script starts an interactive menu:
-  1) Choose protocol (TCP / UDP / TCP+UDP)
+  1) Choose VPN/proxy type (maps to kernel tcp/udp/both tuning profile)
   2) Collect diagnostics (no changes)
   3) Show report + change plan
   4) Apply stage: dry-run / confirm each / one-click apply
@@ -2110,18 +2122,29 @@ _main() {
   _log "Run local time: $RUN_LOCAL"
   _log "Run id (UTC): $RUN_UTC"
 
-  # Protocol selection
-  _menu_select "您这台机器部署的节点属于哪种协议？" \
-    "TCP" \
-    "UDP" \
-    "TCP+UDP"
+  # VPN/proxy selection -> NODE_PROTO (tcp|udp|both) for sysctl plan
+  declare -a VPN_OPTIONS=(
+    "Hysteria2（QUIC/UDP）"
+    "TUIC（QUIC/UDP）"
+    "WireGuard（UDP）"
+    "VMess"
+    "Vless"
+    "Trojan（通常 TCP/TLS）"
+    "Shadowsocks"
+    "Socks5"
+    "ShadowsocksR"
+    "Relay（中转）"
+    "通用/不确定（按 TCP+UDP）"
+  )
+  _menu_select "请选择节点使用的 VPN/代理协议（将自动匹配内核侧调优策略）：" "${VPN_OPTIONS[@]}"
+  VPN_NAME="${VPN_OPTIONS[$MENU_RET]}"
   case "$MENU_RET" in
-    0) NODE_PROTO="tcp" ;;
-    1) NODE_PROTO="udp" ;;
-    2) NODE_PROTO="both" ;;
-    *) NODE_PROTO="tcp" ;;
+    0|1|2) NODE_PROTO="udp" ;;
+    5|8) NODE_PROTO="tcp" ;;
+    3|4|6|7|9|10) NODE_PROTO="both" ;;
+    *) NODE_PROTO="both" ;;
   esac
-  _log "Protocol selected: $NODE_PROTO"
+  _log "VPN/协议: $VPN_NAME | kernel profile: $NODE_PROTO"
 
   # Collect info (no changes)
   _detect_os
@@ -2151,6 +2174,12 @@ _main() {
   printf "IPv6 PMTU: target=%s | method=%s | est=%s | note=%s\n" "$PMTU6_TARGET" "$PMTU6_METHOD" "$PMTU6_EST" "$PMTU6_RISK_NOTE"
   printf "offload: TSO=%s GSO=%s GRO=%s LRO=%s\n" "$OFF_TSO" "$OFF_GSO" "$OFF_GRO" "$OFF_LRO"
   printf "虚拟化: %s | OS: %s | Kernel: %s\n" "$VIRT_TYPE" "$OS_PRETTY" "$KERNEL_REL"
+  case "$NODE_PROTO" in
+    tcp)  printf "VPN/协议: %s | 内核侧策略: TCP\n" "$VPN_NAME" ;;
+    udp)  printf "VPN/协议: %s | 内核侧策略: UDP\n" "$VPN_NAME" ;;
+    both) printf "VPN/协议: %s | 内核侧策略: TCP+UDP\n" "$VPN_NAME" ;;
+    *)    printf "VPN/协议: %s | 内核侧策略: %s\n" "$VPN_NAME" "$NODE_PROTO" ;;
+  esac
 
   printf "\n报告文件:\n  %s\n" "$REPORT_FILE"
   printf "改动清单文件:\n  %s\n" "$PLAN_FILE"
