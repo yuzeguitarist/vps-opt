@@ -101,6 +101,22 @@ SYS_TCP_MAX_SYN_BACKLOG="unknown"
 SYS_TCP_MTU_PROBING="unknown"
 SYS_RPS_SOCK_FLOW_ENTRIES="unknown"
 SYS_UDP_RMEM_MIN="unknown"
+SYS_UDP_WMEM_MIN="unknown"
+
+# UDP path diagnostics
+UDP_SNMP_IN_DATAGRAMS="unknown"
+UDP_SNMP_OUT_DATAGRAMS="unknown"
+UDP_SNMP_NO_PORTS="unknown"
+UDP_SNMP_IN_ERRORS="unknown"
+UDP_SNMP_RCVBUF_ERRORS="unknown"
+UDP_SNMP_SNDBUF_ERRORS="unknown"
+SOFTNET_DROPPED_TOTAL="unknown"
+SOFTNET_TIME_SQUEEZE_TOTAL="unknown"
+IFACE_RX_DROPPED="unknown"
+IFACE_TX_DROPPED="unknown"
+IFACE_RX_ERRORS="unknown"
+IFACE_TX_ERRORS="unknown"
+UDP_DIAG_NOTE="unknown"
 
 # Offloads
 OFF_TSO="unknown"
@@ -832,6 +848,11 @@ _get_buffers_and_mtu_flags() {
   SYS_TCP_MTU_PROBING="$(_sysctl_get net.ipv4.tcp_mtu_probing)"; SYS_TCP_MTU_PROBING="${SYS_TCP_MTU_PROBING:-unknown}"
   SYS_RPS_SOCK_FLOW_ENTRIES="$(_sysctl_get net.core.rps_sock_flow_entries)"; SYS_RPS_SOCK_FLOW_ENTRIES="${SYS_RPS_SOCK_FLOW_ENTRIES:-unknown}"
   SYS_UDP_RMEM_MIN="$(_sysctl_get net.ipv4.udp_rmem_min)"; SYS_UDP_RMEM_MIN="${SYS_UDP_RMEM_MIN:-unknown}"
+  if _sysctl_exists net.ipv4.udp_wmem_min; then
+    SYS_UDP_WMEM_MIN="$(_sysctl_get net.ipv4.udp_wmem_min)"; SYS_UDP_WMEM_MIN="${SYS_UDP_WMEM_MIN:-unknown}"
+  else
+    SYS_UDP_WMEM_MIN="unknown"
+  fi
 }
 
 _get_offload_states() {
@@ -847,6 +868,123 @@ _get_offload_states() {
     OFF_GSO="${OFF_GSO:-unknown}"
     OFF_GRO="${OFF_GRO:-unknown}"
     OFF_LRO="${OFF_LRO:-unknown}"
+  fi
+}
+
+_read_single_value_file() {
+  local path="$1"
+  local val=""
+  if [[ -r "$path" ]]; then
+    read -r val <"$path" || true
+    val="$(_trim "$val")"
+  fi
+  printf "%s" "${val:-unknown}"
+}
+
+_get_udp_path_diagnostics() {
+  UDP_SNMP_IN_DATAGRAMS="unknown"
+  UDP_SNMP_OUT_DATAGRAMS="unknown"
+  UDP_SNMP_NO_PORTS="unknown"
+  UDP_SNMP_IN_ERRORS="unknown"
+  UDP_SNMP_RCVBUF_ERRORS="unknown"
+  UDP_SNMP_SNDBUF_ERRORS="unknown"
+  SOFTNET_DROPPED_TOTAL="unknown"
+  SOFTNET_TIME_SQUEEZE_TOTAL="unknown"
+  IFACE_RX_DROPPED="unknown"
+  IFACE_TX_DROPPED="unknown"
+  IFACE_RX_ERRORS="unknown"
+  IFACE_TX_ERRORS="unknown"
+  UDP_DIAG_NOTE="unknown"
+
+  if [[ -r /proc/net/snmp ]]; then
+    local header_line value_line
+    header_line="$(awk '/^Udp:/ {c++; if (c==1) {for (i=2; i<=NF; i++) printf "%s%s", $i, (i<NF ? " " : ""); print ""; exit}}' /proc/net/snmp 2>/dev/null || true)"
+    value_line="$(awk '/^Udp:/ {c++; if (c==2) {for (i=2; i<=NF; i++) printf "%s%s", $i, (i<NF ? " " : ""); print ""; exit}}' /proc/net/snmp 2>/dev/null || true)"
+    if [[ -n "$header_line" && -n "$value_line" ]]; then
+      local -a names values
+      local i
+      IFS=' ' read -r -a names <<<"$header_line"
+      IFS=' ' read -r -a values <<<"$value_line"
+      for i in "${!names[@]}"; do
+        case "${names[$i]}" in
+          InDatagrams)  UDP_SNMP_IN_DATAGRAMS="${values[$i]:-unknown}" ;;
+          OutDatagrams) UDP_SNMP_OUT_DATAGRAMS="${values[$i]:-unknown}" ;;
+          NoPorts)      UDP_SNMP_NO_PORTS="${values[$i]:-unknown}" ;;
+          InErrors)     UDP_SNMP_IN_ERRORS="${values[$i]:-unknown}" ;;
+          RcvbufErrors) UDP_SNMP_RCVBUF_ERRORS="${values[$i]:-unknown}" ;;
+          SndbufErrors) UDP_SNMP_SNDBUF_ERRORS="${values[$i]:-unknown}" ;;
+        esac
+      done
+    fi
+  fi
+
+  if [[ -r /proc/net/softnet_stat ]]; then
+    local dropped=0
+    local squeezed=0
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      local -a fields
+      IFS=' ' read -r -a fields <<<"$line"
+      if [[ "${fields[1]:-}" =~ ^[[:xdigit:]]+$ ]]; then
+        dropped=$(( dropped + 16#${fields[1]} ))
+      fi
+      if [[ "${fields[2]:-}" =~ ^[[:xdigit:]]+$ ]]; then
+        squeezed=$(( squeezed + 16#${fields[2]} ))
+      fi
+    done </proc/net/softnet_stat
+    SOFTNET_DROPPED_TOTAL="$dropped"
+    SOFTNET_TIME_SQUEEZE_TOTAL="$squeezed"
+  fi
+
+  if [[ "$DEFAULT_IFACE" != "unknown" && -d "/sys/class/net/$DEFAULT_IFACE/statistics" ]]; then
+    local stat_root="/sys/class/net/$DEFAULT_IFACE/statistics"
+    IFACE_RX_DROPPED="$(_read_single_value_file "$stat_root/rx_dropped")"
+    IFACE_TX_DROPPED="$(_read_single_value_file "$stat_root/tx_dropped")"
+    IFACE_RX_ERRORS="$(_read_single_value_file "$stat_root/rx_errors")"
+    IFACE_TX_ERRORS="$(_read_single_value_file "$stat_root/tx_errors")"
+  fi
+
+  local -a issues=()
+  if [[ "$UDP_SNMP_RCVBUF_ERRORS" =~ ^[0-9]+$ ]] && (( UDP_SNMP_RCVBUF_ERRORS > 0 )); then
+    issues+=("UDP RcvbufErrors=${UDP_SNMP_RCVBUF_ERRORS}")
+  fi
+  if [[ "$UDP_SNMP_SNDBUF_ERRORS" =~ ^[0-9]+$ ]] && (( UDP_SNMP_SNDBUF_ERRORS > 0 )); then
+    issues+=("UDP SndbufErrors=${UDP_SNMP_SNDBUF_ERRORS}")
+  fi
+  if [[ "$UDP_SNMP_IN_ERRORS" =~ ^[0-9]+$ ]] && (( UDP_SNMP_IN_ERRORS > 0 )); then
+    issues+=("UDP InErrors=${UDP_SNMP_IN_ERRORS}")
+  fi
+  if [[ "$SOFTNET_DROPPED_TOTAL" =~ ^[0-9]+$ ]] && (( SOFTNET_DROPPED_TOTAL > 0 )); then
+    issues+=("softnet dropped=${SOFTNET_DROPPED_TOTAL}")
+  fi
+  if [[ "$SOFTNET_TIME_SQUEEZE_TOTAL" =~ ^[0-9]+$ ]] && (( SOFTNET_TIME_SQUEEZE_TOTAL > 0 )); then
+    issues+=("softnet time_squeeze=${SOFTNET_TIME_SQUEEZE_TOTAL}")
+  fi
+  if [[ "$IFACE_RX_DROPPED" =~ ^[0-9]+$ ]] && (( IFACE_RX_DROPPED > 0 )); then
+    issues+=("iface rx_dropped=${IFACE_RX_DROPPED}")
+  fi
+  if [[ "$IFACE_TX_DROPPED" =~ ^[0-9]+$ ]] && (( IFACE_TX_DROPPED > 0 )); then
+    issues+=("iface tx_dropped=${IFACE_TX_DROPPED}")
+  fi
+  if [[ "$IFACE_RX_ERRORS" =~ ^[0-9]+$ ]] && (( IFACE_RX_ERRORS > 0 )); then
+    issues+=("iface rx_errors=${IFACE_RX_ERRORS}")
+  fi
+  if [[ "$IFACE_TX_ERRORS" =~ ^[0-9]+$ ]] && (( IFACE_TX_ERRORS > 0 )); then
+    issues+=("iface tx_errors=${IFACE_TX_ERRORS}")
+  fi
+
+  if (( ${#issues[@]} == 0 )); then
+    UDP_DIAG_NOTE="no obvious UDP/softnet/NIC drop counters are non-zero"
+  else
+    local issue
+    UDP_DIAG_NOTE=""
+    for issue in "${issues[@]}"; do
+      if [[ -n "$UDP_DIAG_NOTE" ]]; then
+        UDP_DIAG_NOTE+="; "
+      fi
+      UDP_DIAG_NOTE+="$issue"
+    done
   fi
 }
 
@@ -1216,16 +1354,31 @@ _write_report() {
     printf "  net.ipv4.tcp_mtu_probing: %s\n" "$SYS_TCP_MTU_PROBING"
     printf "  net.core.rps_sock_flow_entries: %s\n" "$SYS_RPS_SOCK_FLOW_ENTRIES"
     printf "  net.ipv4.udp_rmem_min: %s\n" "$SYS_UDP_RMEM_MIN"
+    printf "  net.ipv4.udp_wmem_min: %s\n" "$SYS_UDP_WMEM_MIN"
     printf "\n"
 
-    printf "[6] Offload (read-only)\n"
+    printf "[6] UDP / softnet / NIC drop indicators\n"
+    printf "  Udp InDatagrams: %s\n" "$UDP_SNMP_IN_DATAGRAMS"
+    printf "  Udp OutDatagrams: %s\n" "$UDP_SNMP_OUT_DATAGRAMS"
+    printf "  Udp NoPorts: %s\n" "$UDP_SNMP_NO_PORTS"
+    printf "  Udp InErrors: %s\n" "$UDP_SNMP_IN_ERRORS"
+    printf "  Udp RcvbufErrors: %s\n" "$UDP_SNMP_RCVBUF_ERRORS"
+    printf "  Udp SndbufErrors: %s\n" "$UDP_SNMP_SNDBUF_ERRORS"
+    printf "  softnet dropped total: %s\n" "$SOFTNET_DROPPED_TOTAL"
+    printf "  softnet time_squeeze total: %s\n" "$SOFTNET_TIME_SQUEEZE_TOTAL"
+    printf "  iface rx_dropped / tx_dropped: %s / %s\n" "$IFACE_RX_DROPPED" "$IFACE_TX_DROPPED"
+    printf "  iface rx_errors / tx_errors: %s / %s\n" "$IFACE_RX_ERRORS" "$IFACE_TX_ERRORS"
+    printf "  summary note: %s\n" "$UDP_DIAG_NOTE"
+    printf "\n"
+
+    printf "[7] Offload (read-only)\n"
     printf "  TSO: %s\n" "$OFF_TSO"
     printf "  GSO: %s\n" "$OFF_GSO"
     printf "  GRO: %s\n" "$OFF_GRO"
     printf "  LRO: %s\n" "$OFF_LRO"
     printf "\n"
 
-    printf "[7] Driver-specific suggestions\n"
+    printf "[8] Driver-specific suggestions\n"
     if (( ${#DRIVER_NOTES[@]} == 0 )); then
       printf "  (none)\n"
     else
@@ -1235,7 +1388,7 @@ _write_report() {
     fi
     printf "\n"
 
-    printf "[8] Notes / Safety\n"
+    printf "[9] Notes / Safety\n"
     printf "  - This tool does NOT change MTU, NIC ring sizes, or offload flags by default (risk control).\n"
     printf "  - Apply stage supports dry-run / per-item confirmation / one-click apply.\n"
     printf "  - All applied changes generate a rollback script.\n"
@@ -1299,52 +1452,107 @@ _is_udp_related() {
 # Decide recommended buffer/backlog values by memory size (conservative & safe)
 _calc_recommended_values() {
   # outputs globals:
-  # REC_RMEM_MAX REC_WMEM_MAX REC_TCP_RMEM REC_TCP_WMEM REC_NETDEV_BACKLOG REC_SOMAXCONN REC_SYN_BACKLOG
+  # REC_RMEM_MAX REC_WMEM_MAX REC_RMEM_DEF REC_WMEM_DEF REC_TCP_RMEM REC_TCP_WMEM
+  # REC_NETDEV_BACKLOG REC_SOMAXCONN REC_SYN_BACKLOG REC_UDP_RMEM_MIN REC_UDP_WMEM_MIN
   # REC_MTU_PROBING REC_RPS_SOCK_FLOW_ENTRIES
 
   local mem="$MEM_TOTAL_MB"
-  local rmax wmax backlog somax synb
+  local rmax wmax rdef wdef backlog somax synb udp_floor
 
   if (( mem <= 1024 )); then
     rmax=$(( 8 * 1024 * 1024 ))
     wmax=$(( 8 * 1024 * 1024 ))
+    rdef=262144
+    wdef=262144
     backlog=10000
     somax=2048
     synb=4096
+    udp_floor=32768
   elif (( mem <= 2048 )); then
     rmax=$(( 16 * 1024 * 1024 ))
     wmax=$(( 16 * 1024 * 1024 ))
+    rdef=262144
+    wdef=262144
     backlog=50000
     somax=4096
     synb=8192
+    udp_floor=65536
   elif (( mem <= 4096 )); then
     rmax=$(( 32 * 1024 * 1024 ))
     wmax=$(( 32 * 1024 * 1024 ))
+    rdef=262144
+    wdef=262144
     backlog=100000
     somax=4096
     synb=8192
+    udp_floor=131072
   else
     rmax=$(( 32 * 1024 * 1024 ))
     wmax=$(( 32 * 1024 * 1024 ))
+    rdef=262144
+    wdef=262144
     backlog=250000
     somax=4096
     synb=8192
+    udp_floor=131072
+  fi
+
+  # Hysteria/TUIC/WireGuard use long-lived UDP/QUIC sockets, so give them
+  # larger defaults and buffer floors without touching MTU/offloads.
+  if _is_udp_related; then
+    if (( mem <= 1024 )); then
+      rmax=$(( 16 * 1024 * 1024 ))
+      wmax=$(( 16 * 1024 * 1024 ))
+      rdef=524288
+      wdef=524288
+      backlog=25000
+      udp_floor=65536
+    elif (( mem <= 2048 )); then
+      rmax=$(( 32 * 1024 * 1024 ))
+      wmax=$(( 32 * 1024 * 1024 ))
+      rdef=$(( 1024 * 1024 ))
+      wdef=$(( 1024 * 1024 ))
+      backlog=100000
+      udp_floor=131072
+    elif (( mem <= 4096 )); then
+      rmax=$(( 64 * 1024 * 1024 ))
+      wmax=$(( 64 * 1024 * 1024 ))
+      rdef=$(( 1024 * 1024 ))
+      wdef=$(( 1024 * 1024 ))
+      backlog=200000
+      udp_floor=262144
+    else
+      rmax=$(( 64 * 1024 * 1024 ))
+      wmax=$(( 64 * 1024 * 1024 ))
+      rdef=$(( 1024 * 1024 ))
+      wdef=$(( 1024 * 1024 ))
+      backlog=300000
+      udp_floor=262144
+    fi
   fi
 
   REC_RMEM_MAX="$rmax"
   REC_WMEM_MAX="$wmax"
+  REC_RMEM_DEF="$rdef"
+  REC_WMEM_DEF="$wdef"
   REC_TCP_RMEM="4096 87380 $rmax"
   REC_TCP_WMEM="4096 65536 $wmax"
   REC_NETDEV_BACKLOG="$backlog"
   REC_SOMAXCONN="$somax"
   REC_SYN_BACKLOG="$synb"
+  REC_UDP_RMEM_MIN="$udp_floor"
+  REC_UDP_WMEM_MIN="$udp_floor"
 
   # MTU probing: enable if we suspect PMTU mismatch OR if currently disabled and node is TCP-ish
   REC_MTU_PROBING="1"
 
   # RPS flows: only useful with multiple CPUs
   if (( CPU_COUNT > 1 )); then
-    REC_RPS_SOCK_FLOW_ENTRIES="32768"
+    if _is_udp_related; then
+      REC_RPS_SOCK_FLOW_ENTRIES="65536"
+    else
+      REC_RPS_SOCK_FLOW_ENTRIES="32768"
+    fi
   else
     REC_RPS_SOCK_FLOW_ENTRIES="0"
   fi
@@ -1382,11 +1590,11 @@ _build_plan() {
   fi
 
   # Defaults (moderate, not too aggressive)
-  if [[ "$SYS_RMEM_DEF" =~ ^[0-9]+$ ]] && (( SYS_RMEM_DEF < 262144 )); then
-    _plan_add_sysctl "rmem_default" "提高 net.core.rmem_default（默认接收缓冲）" "LOW" "net.core.rmem_default" "262144"
+  if [[ "$SYS_RMEM_DEF" =~ ^[0-9]+$ ]] && (( SYS_RMEM_DEF < REC_RMEM_DEF )); then
+    _plan_add_sysctl "rmem_default" "提高 net.core.rmem_default（默认接收缓冲）" "LOW" "net.core.rmem_default" "$REC_RMEM_DEF"
   fi
-  if [[ "$SYS_WMEM_DEF" =~ ^[0-9]+$ ]] && (( SYS_WMEM_DEF < 262144 )); then
-    _plan_add_sysctl "wmem_default" "提高 net.core.wmem_default（默认发送缓冲）" "LOW" "net.core.wmem_default" "262144"
+  if [[ "$SYS_WMEM_DEF" =~ ^[0-9]+$ ]] && (( SYS_WMEM_DEF < REC_WMEM_DEF )); then
+    _plan_add_sysctl "wmem_default" "提高 net.core.wmem_default（默认发送缓冲）" "LOW" "net.core.wmem_default" "$REC_WMEM_DEF"
   fi
 
   # tcp_rmem / tcp_wmem (set full triplet)
@@ -1428,8 +1636,13 @@ _build_plan() {
   # 3b) UDP receive floor (when profile includes UDP)
   if _is_udp_related; then
     if _sysctl_exists net.ipv4.udp_rmem_min; then
-      if [[ "$SYS_UDP_RMEM_MIN" =~ ^[0-9]+$ ]] && (( SYS_UDP_RMEM_MIN < 8192 )); then
-        _plan_add_sysctl "udp_rmem_min" "提高 net.ipv4.udp_rmem_min（UDP 接收下限，代理/QUIC 场景）" "LOW" "net.ipv4.udp_rmem_min" "8192"
+      if [[ "$SYS_UDP_RMEM_MIN" =~ ^[0-9]+$ ]] && (( SYS_UDP_RMEM_MIN < REC_UDP_RMEM_MIN )); then
+        _plan_add_sysctl "udp_rmem_min" "提高 net.ipv4.udp_rmem_min（Hysteria/QUIC 接收下限）" "LOW" "net.ipv4.udp_rmem_min" "$REC_UDP_RMEM_MIN"
+      fi
+    fi
+    if _sysctl_exists net.ipv4.udp_wmem_min; then
+      if [[ "$SYS_UDP_WMEM_MIN" =~ ^[0-9]+$ ]] && (( SYS_UDP_WMEM_MIN < REC_UDP_WMEM_MIN )); then
+        _plan_add_sysctl "udp_wmem_min" "提高 net.ipv4.udp_wmem_min（Hysteria/QUIC 发送下限）" "LOW" "net.ipv4.udp_wmem_min" "$REC_UDP_WMEM_MIN"
       fi
     fi
   fi
@@ -2156,6 +2369,7 @@ _main() {
   _get_tcp_cc_and_qdisc
   _get_buffers_and_mtu_flags
   _get_offload_states
+  _get_udp_path_diagnostics
   _driver_specific_notes
   _pmtu_probe
 
@@ -2170,6 +2384,12 @@ _main() {
     "$DEFAULT_IFACE" "$IFACE_SPEED" "$IFACE_DRIVER" "$IFACE_QUEUES_RX" "$IFACE_QUEUES_TX" "$IFACE_QUEUES_COMBINED"
   printf "拥塞控制: 当前=%s | 可用=%s\n" "$TCP_CC_CUR" "$TCP_CC_AVAIL"
   printf "qdisc: 当前=%s | default_qdisc=%s | fq支持=%s\n" "$QDISC_CUR" "$QDISC_DEFAULT" "$QDISC_FQ_SUPPORTED"
+  if _is_udp_related; then
+    printf "UDP诊断: InErrors=%s | RcvbufErrors=%s | SndbufErrors=%s | softnet(dropped/squeezed)=%s/%s\n" \
+      "$UDP_SNMP_IN_ERRORS" "$UDP_SNMP_RCVBUF_ERRORS" "$UDP_SNMP_SNDBUF_ERRORS" "$SOFTNET_DROPPED_TOTAL" "$SOFTNET_TIME_SQUEEZE_TOTAL"
+    printf "UDP队列: iface(rx_drop/tx_drop)=%s/%s | note=%s\n" \
+      "$IFACE_RX_DROPPED" "$IFACE_TX_DROPPED" "$UDP_DIAG_NOTE"
+  fi
   printf "IPv4 PMTU: target=%s | method=%s | est=%s | note=%s\n" "$PMTU_TARGET" "$PMTU_METHOD" "$PMTU_EST" "$PMTU_RISK_NOTE"
   printf "IPv6 PMTU: target=%s | method=%s | est=%s | note=%s\n" "$PMTU6_TARGET" "$PMTU6_METHOD" "$PMTU6_EST" "$PMTU6_RISK_NOTE"
   printf "offload: TSO=%s GSO=%s GRO=%s LRO=%s\n" "$OFF_TSO" "$OFF_GSO" "$OFF_GRO" "$OFF_LRO"
